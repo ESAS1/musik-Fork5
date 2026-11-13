@@ -1,0 +1,398 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// ErrContextNotFound is returned when a context write addresses a missing row.
+var ErrContextNotFound = errors.New("context not found")
+
+type TasteContext struct {
+	ID              string       `json:"context_id"`
+	Kind            string       `json:"kind"`
+	Name            string       `json:"name"`
+	Icon            string       `json:"icon,omitempty"`
+	Influence       float64      `json:"influence"`
+	LearningEnabled bool         `json:"learning_enabled"`
+	Seeds           ContextSeeds `json:"seeds"`
+	CreatedAt       string       `json:"created_at"`
+	UpdatedAt       string       `json:"updated_at"`
+	ArchivedAt      string       `json:"archived_at,omitempty"`
+	PositiveSamples int          `json:"positive_samples"`
+	HasVector       bool         `json:"has_vector"`
+}
+
+type ContextSeeds struct {
+	SchemaVersion int                `json:"schema_version"`
+	Tracks        []int64            `json:"tracks,omitempty"`
+	Artists       []string           `json:"artists,omitempty"`
+	Albums        []ContextAlbumSeed `json:"albums,omitempty"`
+}
+
+type ContextAlbumSeed struct {
+	Artist string `json:"artist"`
+	Album  string `json:"album"`
+}
+
+type TasteContextState struct {
+	ContextID       string
+	PositiveVector  []byte
+	EmbeddingDim    int
+	PositiveSamples int
+	NegativeSamples int
+	NegativesJSON   string
+	ModelVersion    string
+	UpdatedAt       string
+}
+
+func validContextKind(kind string) bool {
+	switch kind {
+	case "mood", "place", "activity":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Store) CreateTasteContext(ctx TasteContext) (TasteContext, error) {
+	err := insertTasteContext(s.DB, s.ProfileID, &ctx)
+	return ctx, err
+}
+
+func insertTasteContext(q sqlQuery, profileID string, ctx *TasteContext) error {
+	if ctx.ID == "" {
+		ctx.ID = NewID()
+	}
+	if !validContextKind(ctx.Kind) {
+		return fmt.Errorf("kind must be mood, place or activity")
+	}
+	ctx.Name = strings.TrimSpace(ctx.Name)
+	if ctx.Name == "" {
+		return fmt.Errorf("name required")
+	}
+	if ctx.Influence <= 0 {
+		ctx.Influence = 1
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	ctx.CreatedAt, ctx.UpdatedAt = now, now
+	if ctx.Seeds.SchemaVersion == 0 && (len(ctx.Seeds.Tracks) > 0 || len(ctx.Seeds.Artists) > 0 || len(ctx.Seeds.Albums) > 0) {
+		ctx.Seeds.SchemaVersion = 1
+	}
+	var seedsJSON sql.NullString
+	var seedsVer sql.NullInt64
+	if ctx.Seeds.SchemaVersion > 0 {
+		payload, err := json.Marshal(ctx.Seeds)
+		if err != nil {
+			return err
+		}
+		seedsJSON = sql.NullString{String: string(payload), Valid: true}
+		seedsVer = sql.NullInt64{Int64: int64(ctx.Seeds.SchemaVersion), Valid: true}
+	}
+	learning := 1
+	if !ctx.LearningEnabled {
+		learning = 0
+	}
+	_, err := q.Exec(`
+INSERT INTO taste_contexts(
+  context_id, kind, name, icon, influence, learning_enabled,
+  seeds_schema_version, seeds_json, created_at, updated_at, profile_id
+) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		ctx.ID, ctx.Kind, ctx.Name, nullStr(ctx.Icon), ctx.Influence, learning,
+		seedsVer, seedsJSON, ctx.CreatedAt, ctx.UpdatedAt, profileID)
+	return err
+}
+
+func (s *Store) UpdateTasteContext(ctx TasteContext) error {
+	_, err := updateTasteContext(s.DB, s.ProfileID, ctx)
+	return err
+}
+
+func updateTasteContext(q sqlQuery, profileID string, ctx TasteContext) (int64, error) {
+	if ctx.ID == "" {
+		return 0, fmt.Errorf("context_id required")
+	}
+	if ctx.Name != "" {
+		ctx.Name = strings.TrimSpace(ctx.Name)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var seedsJSON sql.NullString
+	var seedsVer sql.NullInt64
+	if ctx.Seeds.SchemaVersion > 0 {
+		payload, err := json.Marshal(ctx.Seeds)
+		if err != nil {
+			return 0, err
+		}
+		seedsJSON = sql.NullString{String: string(payload), Valid: true}
+		seedsVer = sql.NullInt64{Int64: int64(ctx.Seeds.SchemaVersion), Valid: true}
+	}
+	learning := 1
+	if !ctx.LearningEnabled {
+		learning = 0
+	}
+	// Influence is the resolved weight, including zero. Callers that omit the
+	// field keep the stored value before they reach this write.
+	sets := []string{"learning_enabled = ?", "influence = ?", "updated_at = ?"}
+	args := []any{learning, ctx.Influence, now}
+	if ctx.Name != "" {
+		sets = append(sets, "name = ?")
+		args = append(args, ctx.Name)
+	}
+	if ctx.Icon != "" {
+		sets = append(sets, "icon = ?")
+		args = append(args, ctx.Icon)
+	}
+	if seedsJSON.Valid {
+		sets = append(sets, "seeds_schema_version = ?", "seeds_json = ?")
+		args = append(args, seedsVer, seedsJSON)
+	}
+	args = append(args, profileID, ctx.ID)
+	res, err := q.Exec(`UPDATE taste_contexts SET `+strings.Join(sets, ", ")+`
+WHERE profile_id = ? AND context_id = ? AND archived_at IS NULL`, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// CommitTasteContext writes the context and, when vector is non-empty, its
+// seed state in one transaction. An empty vector leaves an existing state row
+// untouched. create inserts; otherwise the active row is updated.
+func (s *Store) CommitTasteContext(ctx context.Context, taste TasteContext, vector []byte, dim int, create bool) (*TasteContext, error) {
+	err := s.DB.InTx(ctx, func(tx *Tx) error {
+		q := queryCtx{ctx: ctx, tx: tx}
+		if create {
+			if err := insertTasteContext(q, s.ProfileID, &taste); err != nil {
+				return err
+			}
+		} else {
+			n, err := updateTasteContext(q, s.ProfileID, taste)
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return ErrContextNotFound
+			}
+		}
+		if len(vector) == 0 {
+			return nil
+		}
+		samples := 0
+		var got int
+		err := q.QueryRow(`
+SELECT positive_samples FROM taste_context_states
+WHERE profile_id = ? AND context_id = ?`, s.ProfileID, taste.ID).Scan(&got)
+		if err == nil {
+			samples = got
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		return upsertTasteContextState(q, s.ProfileID, TasteContextState{
+			ContextID: taste.ID, PositiveVector: vector,
+			EmbeddingDim: dim, PositiveSamples: samples,
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	out, err := s.GetTasteContext(taste.ID)
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		return nil, ErrContextNotFound
+	}
+	return out, nil
+}
+
+func (s *Store) ArchiveTasteContext(id string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.DB.Exec(`
+UPDATE taste_contexts SET archived_at = ?, updated_at = ?
+WHERE profile_id = ? AND context_id = ? AND archived_at IS NULL`, now, now, s.ProfileID, id)
+	return err
+}
+
+func (s *Store) GetTasteContext(id string) (*TasteContext, error) {
+	row := s.DB.QueryRow(`
+SELECT c.context_id, c.kind, c.name, COALESCE(c.icon,''), c.influence, c.learning_enabled,
+       c.seeds_schema_version, c.seeds_json, c.created_at, c.updated_at, COALESCE(c.archived_at,''),
+       COALESCE(s.positive_samples,0), s.positive_vector
+FROM taste_contexts c
+LEFT JOIN taste_context_states s ON s.profile_id = c.profile_id AND s.context_id = c.context_id
+WHERE c.profile_id = ? AND c.context_id = ?`, s.ProfileID, id)
+	return scanTasteContext(row)
+}
+
+func (s *Store) ListTasteContexts(includeArchived bool) ([]TasteContext, error) {
+	q := `
+SELECT c.context_id, c.kind, c.name, COALESCE(c.icon,''), c.influence, c.learning_enabled,
+       c.seeds_schema_version, c.seeds_json, c.created_at, c.updated_at, COALESCE(c.archived_at,''),
+       COALESCE(s.positive_samples,0), s.positive_vector
+FROM taste_contexts c
+LEFT JOIN taste_context_states s ON s.profile_id = c.profile_id AND s.context_id = c.context_id
+WHERE c.profile_id = ?`
+	if !includeArchived {
+		q += ` AND c.archived_at IS NULL`
+	}
+	q += ` ORDER BY c.kind, c.name`
+	rows, err := s.DB.Query(q, s.ProfileID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TasteContext
+	for rows.Next() {
+		ctx, err := scanTasteContext(rows)
+		if err != nil {
+			return nil, err
+		}
+		if ctx != nil {
+			out = append(out, *ctx)
+		}
+	}
+	return out, rows.Err()
+}
+
+type contextScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanTasteContext(row contextScanner) (*TasteContext, error) {
+	var ctx TasteContext
+	var learning int
+	var seedsVer sql.NullInt64
+	var seedsJSON sql.NullString
+	var vector []byte
+	if err := row.Scan(&ctx.ID, &ctx.Kind, &ctx.Name, &ctx.Icon, &ctx.Influence, &learning,
+		&seedsVer, &seedsJSON, &ctx.CreatedAt, &ctx.UpdatedAt, &ctx.ArchivedAt,
+		&ctx.PositiveSamples, &vector); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	ctx.LearningEnabled = learning == 1
+	ctx.HasVector = len(vector) > 0
+	if seedsJSON.Valid {
+		_ = json.Unmarshal([]byte(seedsJSON.String), &ctx.Seeds)
+		if seedsVer.Valid {
+			ctx.Seeds.SchemaVersion = int(seedsVer.Int64)
+		}
+	}
+	return &ctx, nil
+}
+
+func (s *Store) UpsertTasteContextState(state TasteContextState) error {
+	return upsertTasteContextState(s.DB, s.ProfileID, state)
+}
+
+func upsertTasteContextState(q sqlQuery, profileID string, state TasteContextState) error {
+	if state.ModelVersion == "" {
+		state.ModelVersion = "clap-default"
+	}
+	if state.UpdatedAt == "" {
+		state.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	var dim sql.NullInt64
+	if state.EmbeddingDim > 0 {
+		dim = sql.NullInt64{Int64: int64(state.EmbeddingDim), Valid: true}
+	}
+	_, err := q.Exec(`
+INSERT INTO taste_context_states(
+  context_id, positive_vector, embedding_dim, negative_prototypes_json,
+  positive_samples, negative_samples, model_version, updated_at, profile_id
+) VALUES (?,?,?,?,?,?,?,?,?)
+ON CONFLICT(profile_id,context_id) DO UPDATE SET
+  positive_vector=excluded.positive_vector,
+  embedding_dim=excluded.embedding_dim,
+  negative_prototypes_json=excluded.negative_prototypes_json,
+  positive_samples=excluded.positive_samples,
+  negative_samples=excluded.negative_samples,
+  model_version=excluded.model_version,
+  updated_at=excluded.updated_at`,
+		state.ContextID, nullBytes(state.PositiveVector), dim, nullStr(state.NegativesJSON),
+		state.PositiveSamples, state.NegativeSamples, state.ModelVersion, state.UpdatedAt, profileID)
+	return err
+}
+
+func (s *Store) LoadTasteContextState(id string) (*TasteContextState, error) {
+	var state TasteContextState
+	var dim sql.NullInt64
+	var vector []byte
+	err := s.DB.QueryRow(`
+SELECT context_id, positive_vector, embedding_dim, COALESCE(negative_prototypes_json,''),
+       positive_samples, negative_samples, model_version, updated_at
+FROM taste_context_states WHERE profile_id = ? AND context_id = ?`, s.ProfileID, id).Scan(
+		&state.ContextID, &vector, &dim, &state.NegativesJSON,
+		&state.PositiveSamples, &state.NegativeSamples, &state.ModelVersion, &state.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	state.PositiveVector = vector
+	if dim.Valid {
+		state.EmbeddingDim = int(dim.Int64)
+	}
+	return &state, nil
+}
+
+func (s *Store) SetSessionContexts(sessionID string, contextIDs []string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+UPDATE session_contexts SET deactivated_at = ?
+WHERE profile_id = ? AND session_id = ? AND deactivated_at IS NULL`, now, s.ProfileID, sessionID); err != nil {
+		return err
+	}
+	for _, id := range contextIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, err := tx.Exec(`
+INSERT INTO session_contexts(session_id, context_id, activated_at, profile_id)
+VALUES (?,?,?,?)`, sessionID, id, now, s.ProfileID); err != nil {
+			return err
+		}
+	}
+	payload, _ := json.Marshal(contextIDs)
+	if _, err := tx.Exec(`
+UPDATE play_sessions SET active_contexts_json = ? WHERE profile_id = ? AND id = ?`, string(payload), s.ProfileID, sessionID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) AttachRequestContexts(requestID string, contextIDs []string) error {
+	for _, id := range contextIDs {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		if _, err := s.DB.Exec(`
+INSERT INTO request_contexts(request_id, context_id, profile_id) VALUES (?,?,?)
+ON CONFLICT DO NOTHING`,
+			requestID, id, s.ProfileID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func nullBytes(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
